@@ -12,12 +12,24 @@ import logging
 import re
 import shlex
 import subprocess
+import asyncio
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass, asdict
 from enum import Enum
 import requests
+from playwright.async_api import async_playwright, Browser, Page, BrowserContext
+import base64
+from io import BytesIO
+
+try:
+    import browser_use
+    from browser_use.browser.browser import Browser as BrowserUseSession
+    BROWSER_USE_AVAILABLE = True
+except ImportError:
+    BROWSER_USE_AVAILABLE = False
+    print("WARNING: browser-use not installed. Vision-based navigation disabled. Install with: pip install browser-use")
 
 # ============================================================================
 # Configuration
@@ -30,6 +42,11 @@ class Config:
     FIRECRAWL_API_KEY = "fc-b0f03723a0e048abae7eb04101d189a0"
     OPENROUTER_API_KEY = "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"
     OPENROUTER_MODEL = "anthropic/claude-3.5-sonnet"
+
+    # Vision Model for Browser Automation (Agent0-style)
+    VISION_MODEL = "openai/gpt-4o"  # Vision-capable model for screenshot analysis
+    VISION_MODEL_API_KEY = OPENROUTER_API_KEY  # Can use same or different key
+    USE_VISION = True  # Enable computer vision for browser automation
     
     # Research Parameters
     CYCLE_DELAY = 30  # Longer cycles for thorough research
@@ -47,6 +64,16 @@ class Config:
     KNOWLEDGE_PATH = BASE_PATH / "knowledge"
     LOGS_PATH = BASE_PATH / "logs"
     PAPERS_PATH = BASE_PATH / "research_papers"
+    BROWSER_DATA_PATH = BASE_PATH / "browser_data"  # For cookies and session storage
+
+    # Browser Configuration
+    BROWSER_HEADLESS = True
+    BROWSER_TIMEOUT = 60000  # 60 seconds
+    BROWSER_NAVIGATION_TIMEOUT = 30000  # 30 seconds
+
+    # Search Engine URLs
+    BRAVE_SEARCH_URL = "https://search.brave.com/?lang=en-in"
+    DUCKDUCKGO_SEARCH_URL = "https://duckduckgo.com/"
     
     # System Prompt
     SYSTEM_PROMPT = """You are an Academic Discovery Agent - a rigorous research system focused on discovering and validating knowledge with the highest academic standards.
@@ -146,7 +173,964 @@ class ResearchQuestion:
 
 
 # ============================================================================
-# Foundation Tools
+# Browser Infrastructure
+# ============================================================================
+
+class ChromiumBrowserManager:
+    """Manages headless Chromium browser with persistent sessions"""
+
+    def __init__(self, data_path: Path, headless: bool = True):
+        self.data_path = data_path
+        self.headless = headless
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self._initialized = False
+
+        # Ensure browser data directory exists
+        self.data_path.mkdir(parents=True, exist_ok=True)
+
+    async def initialize(self):
+        """Initialize browser with persistent context"""
+        if self._initialized:
+            return
+
+        try:
+            self.playwright = await async_playwright().start()
+
+            # Launch Chromium browser
+            self.browser = await self.playwright.chromium.launch(
+                headless=self.headless,
+                args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-dev-shm-usage',
+                    '--no-sandbox'
+                ]
+            )
+
+            # Create persistent context to save cookies and session
+            self.context = await self.browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                viewport={'width': 1920, 'height': 1080},
+                locale='en-US',
+                timezone_id='America/New_York',
+                # Enable cookie and storage persistence
+                storage_state=self._get_storage_state_path() if self._storage_exists() else None
+            )
+
+            self._initialized = True
+            print(f"DEBUG: Browser initialized with session persistence at {self.data_path}")
+
+        except Exception as e:
+            print(f"ERROR: Failed to initialize browser: {e}")
+            raise
+
+    async def new_page(self) -> Page:
+        """Create a new page in the persistent context"""
+        if not self._initialized:
+            await self.initialize()
+
+        return await self.context.new_page()
+
+    async def save_session(self):
+        """Save current session state (cookies, localStorage, etc.)"""
+        if self.context:
+            try:
+                storage_state = await self.context.storage_state()
+                with open(self._get_storage_state_path(), 'w') as f:
+                    json.dump(storage_state, f, indent=2)
+                print(f"DEBUG: Session saved to {self._get_storage_state_path()}")
+            except Exception as e:
+                print(f"ERROR: Failed to save session: {e}")
+
+    async def close(self):
+        """Close browser and save session"""
+        if self.context:
+            await self.save_session()
+
+        if self.browser:
+            await self.browser.close()
+
+        if self.playwright:
+            await self.playwright.stop()
+
+        self._initialized = False
+
+    def _get_storage_state_path(self) -> str:
+        """Get path to storage state file"""
+        return str(self.data_path / "session_state.json")
+
+    def _storage_exists(self) -> bool:
+        """Check if saved session exists"""
+        return Path(self._get_storage_state_path()).exists()
+
+
+class LLMBrowserNavigator:
+    """LLM-guided browser navigation and content extraction"""
+
+    def __init__(self, reasoning_engine):
+        self.reasoning = reasoning_engine
+
+    async def navigate_and_search(self, page: Page, search_url: str, query: str, engine_name: str) -> Dict:
+        """Navigate to search engine and perform search using LLM guidance"""
+        try:
+            # Navigate to search engine
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=Config.BROWSER_NAVIGATION_TIMEOUT)
+            await asyncio.sleep(2)  # Wait for page to fully load
+
+            # Get page content for LLM analysis
+            page_html = await page.content()
+
+            # Use LLM to identify search input
+            search_selector = await self._find_search_input(page, page_html, engine_name)
+
+            if not search_selector:
+                return {"success": False, "error": "Could not find search input"}
+
+            # Enter search query
+            await page.fill(search_selector, query)
+            await asyncio.sleep(1)
+
+            # Submit search (try Enter key first, then look for button)
+            try:
+                await page.press(search_selector, "Enter")
+            except:
+                # If Enter doesn't work, try to find and click search button
+                submit_button = await self._find_search_button(page, engine_name)
+                if submit_button:
+                    await page.click(submit_button)
+
+            # Wait for results to load
+            await asyncio.sleep(3)
+            await page.wait_for_load_state("networkidle", timeout=Config.BROWSER_TIMEOUT)
+
+            # Extract search results using LLM guidance
+            results = await self._extract_search_results(page, engine_name)
+
+            return {
+                "success": True,
+                "results": results,
+                "query": query
+            }
+
+        except Exception as e:
+            print(f"ERROR: Navigation failed: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def _find_search_input(self, page: Page, page_html: str, engine_name: str) -> Optional[str]:
+        """Use LLM to identify search input selector"""
+
+        # Common patterns for different search engines
+        if "brave" in engine_name.lower():
+            # Try common Brave search selectors first
+            selectors = [
+                'input[type="search"]',
+                'input[name="q"]',
+                '#searchbox',
+                'input.search-input'
+            ]
+        elif "duckduckgo" in engine_name.lower():
+            selectors = [
+                'input[name="q"]',
+                '#search_form_input',
+                'input[type="text"]'
+            ]
+        else:
+            selectors = [
+                'input[type="search"]',
+                'input[name="q"]',
+                'input[name="query"]'
+            ]
+
+        # Try each selector
+        for selector in selectors:
+            try:
+                element = await page.query_selector(selector)
+                if element and await element.is_visible():
+                    print(f"DEBUG: Found search input with selector: {selector}")
+                    return selector
+            except:
+                continue
+
+        # Fallback: Use first visible input
+        try:
+            inputs = await page.query_selector_all('input')
+            for input_elem in inputs:
+                if await input_elem.is_visible():
+                    input_type = await input_elem.get_attribute('type')
+                    if input_type in ['text', 'search', None]:
+                        print(f"DEBUG: Using fallback input element")
+                        return 'input'
+        except:
+            pass
+
+        return None
+
+    async def _find_search_button(self, page: Page, engine_name: str) -> Optional[str]:
+        """Find search submit button"""
+        selectors = [
+            'button[type="submit"]',
+            'input[type="submit"]',
+            'button.search-btn',
+            'button'
+        ]
+
+        for selector in selectors:
+            try:
+                element = await page.query_selector(selector)
+                if element and await element.is_visible():
+                    return selector
+            except:
+                continue
+
+        return None
+
+    async def _extract_search_results(self, page: Page, engine_name: str) -> List[Dict]:
+        """Extract search results from the page"""
+        results = []
+
+        try:
+            # Get page content
+            page_content = await page.content()
+
+            # Define selectors for different search engines
+            if "brave" in engine_name.lower():
+                result_selectors = [
+                    'div.snippet',
+                    'div[data-type="web"]',
+                    'div.result'
+                ]
+            elif "duckduckgo" in engine_name.lower():
+                result_selectors = [
+                    'article[data-testid="result"]',
+                    'div.result',
+                    'li[data-layout="organic"]'
+                ]
+            else:
+                result_selectors = ['div.result', 'article', 'div.search-result']
+
+            # Try each selector
+            for selector in result_selectors:
+                result_elements = await page.query_selector_all(selector)
+                if len(result_elements) > 0:
+                    print(f"DEBUG: Found {len(result_elements)} results with selector: {selector}")
+
+                    for elem in result_elements[:10]:  # Limit to top 10
+                        try:
+                            # Extract link
+                            link_elem = await elem.query_selector('a')
+                            url = await link_elem.get_attribute('href') if link_elem else None
+
+                            # Extract title
+                            title_elem = await elem.query_selector('h1, h2, h3, h4')
+                            title = await title_elem.inner_text() if title_elem else "No title"
+
+                            # Extract description/snippet
+                            text = await elem.inner_text()
+
+                            if url and url.startswith('http'):
+                                results.append({
+                                    "url": url,
+                                    "title": title.strip(),
+                                    "snippet": text.strip()[:500],
+                                    "quality_score": 0.5  # Base score
+                                })
+                        except Exception as e:
+                            print(f"DEBUG: Error extracting result: {e}")
+                            continue
+
+                    if len(results) > 0:
+                        break  # Found results, stop trying other selectors
+
+            print(f"DEBUG: Extracted {len(results)} search results")
+
+        except Exception as e:
+            print(f"ERROR: Failed to extract results: {e}")
+
+        return results
+
+    async def scrape_url(self, page: Page, url: str) -> Dict:
+        """Scrape content from a single URL"""
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=Config.BROWSER_NAVIGATION_TIMEOUT)
+            await asyncio.sleep(2)
+
+            # Extract main content
+            content = await self._extract_main_content(page)
+
+            # Extract metadata
+            title = await page.title()
+
+            return {
+                "success": True,
+                "url": url,
+                "title": title,
+                "text": content,
+                "length": len(content)
+            }
+
+        except Exception as e:
+            return {
+                "success": False,
+                "url": url,
+                "error": str(e)
+            }
+
+    async def _extract_main_content(self, page: Page) -> str:
+        """Extract main content from page"""
+        try:
+            # Try to find main content areas
+            selectors = [
+                'article',
+                'main',
+                '[role="main"]',
+                '.article-body',
+                '.content',
+                '#content',
+                'body'
+            ]
+
+            for selector in selectors:
+                try:
+                    element = await page.query_selector(selector)
+                    if element:
+                        # Remove unwanted elements
+                        await page.evaluate("""() => {
+                            ['script', 'style', 'nav', 'header', 'footer', 'aside', 'iframe'].forEach(tag => {
+                                document.querySelectorAll(tag).forEach(el => el.remove());
+                            });
+                        }""")
+
+                        text = await element.inner_text()
+                        if len(text) > 500:  # Meaningful content
+                            return text
+                except:
+                    continue
+
+            # Fallback to body
+            body = await page.query_selector('body')
+            if body:
+                return await body.inner_text()
+
+            return ""
+
+        except Exception as e:
+            print(f"ERROR: Failed to extract content: {e}")
+            return ""
+
+
+class VisionBrowserNavigator:
+    """Agent0-style computer vision browser navigation using browser-use"""
+
+    def __init__(self, reasoning_engine):
+        self.reasoning = reasoning_engine
+        self.browser_session = None
+
+    async def initialize_browser_use(self):
+        """Initialize browser-use session"""
+        if not BROWSER_USE_AVAILABLE:
+            raise ImportError("browser-use library not available. Install with: pip install browser-use")
+
+        if self.browser_session is None:
+            self.browser_session = BrowserUseSession(
+                headless=Config.BROWSER_HEADLESS,
+                disable_security=True  # For research purposes
+            )
+            print("DEBUG: browser-use session initialized with vision capabilities")
+
+    async def navigate_and_search_with_vision(self, search_url: str, query: str, engine_name: str) -> Dict:
+        """Navigate to search engine and perform search using computer vision"""
+        try:
+            await self.initialize_browser_use()
+
+            # Create browser-use agent with vision LLM
+            task = f"Navigate to {search_url}, find the search box, enter the query '{query}', and submit the search. Then extract the top 10 search results including titles, URLs, and descriptions."
+
+            # Create custom LLM wrapper for browser-use
+            llm = self._create_vision_llm()
+
+            agent = browser_use.Agent(
+                task=task,
+                browser_session=self.browser_session,
+                llm=llm,
+                use_vision=Config.USE_VISION
+            )
+
+            # Run the agent to perform the search
+            print(f"DEBUG: Running vision agent for {engine_name} search...")
+            result = await agent.run()
+
+            # Parse the agent's result to extract search results
+            search_results = self._parse_agent_results(result, engine_name)
+
+            return {
+                "success": True,
+                "results": search_results,
+                "query": query
+            }
+
+        except Exception as e:
+            print(f"ERROR: Vision navigation failed: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def scrape_url_with_vision(self, url: str) -> Dict:
+        """Scrape URL using computer vision"""
+        try:
+            await self.initialize_browser_use()
+
+            task = f"Navigate to {url} and extract all the main content text from the article or page. Focus on the body content, ignoring navigation, headers, footers, and ads."
+
+            llm = self._create_vision_llm()
+
+            agent = browser_use.Agent(
+                task=task,
+                browser_session=self.browser_session,
+                llm=llm,
+                use_vision=Config.USE_VISION
+            )
+
+            print(f"DEBUG: Scraping {url} with vision...")
+            result = await agent.run()
+
+            # Extract content from agent result
+            content = self._extract_content_from_result(result)
+
+            return {
+                "success": True,
+                "url": url,
+                "title": "Vision-extracted content",
+                "text": content,
+                "length": len(content)
+            }
+
+        except Exception as e:
+            print(f"ERROR: Vision scraping failed: {e}")
+            return {
+                "success": False,
+                "url": url,
+                "error": str(e)
+            }
+
+    def _create_vision_llm(self):
+        """Create LLM wrapper for browser-use that uses our ReasoningEngine"""
+
+        class VisionLLM:
+            def __init__(self, reasoning_engine):
+                self.reasoning = reasoning_engine
+
+            async def __call__(self, messages, **kwargs):
+                """Call LLM with messages (browser-use interface)"""
+                # Extract text prompt and image if present
+                text_prompt = ""
+                image_base64 = None
+
+                for message in messages:
+                    if isinstance(message.get('content'), list):
+                        for content in message['content']:
+                            if content['type'] == 'text':
+                                text_prompt += content['text'] + "\n"
+                            elif content['type'] == 'image_url':
+                                # Extract base64 from data URL
+                                image_url = content['image_url']['url']
+                                if image_url.startswith('data:image'):
+                                    image_base64 = image_url.split(',')[1]
+                    elif isinstance(message.get('content'), str):
+                        text_prompt += message['content'] + "\n"
+
+                # Call appropriate reasoning method
+                if image_base64 and Config.USE_VISION:
+                    response = self.reasoning.reason_with_vision(
+                        text_prompt,
+                        image_base64,
+                        system_prompt="You are an expert browser automation agent. Analyze screenshots and provide precise actions."
+                    )
+                else:
+                    response = self.reasoning.reason(
+                        text_prompt,
+                        system_prompt="You are an expert browser automation agent."
+                    )
+
+                return {"choices": [{"message": {"content": response}}]}
+
+        return VisionLLM(self.reasoning)
+
+    def _parse_agent_results(self, result, engine_name: str) -> List[Dict]:
+        """Parse browser-use agent results into search results format"""
+        # The result from browser-use agent contains the extracted information
+        # We need to parse it into our standard format
+
+        search_results = []
+
+        # browser-use returns the result as text, we need to parse it
+        if isinstance(result, dict) and 'history' in result:
+            # Get the final output from the agent
+            history = result['history']
+            if history and len(history) > 0:
+                last_item = history[-1]
+                extracted_text = last_item.get('result', '')
+
+                # Parse the extracted text to find URLs and titles
+                # This is a simple parser - in production you'd want more robust parsing
+                lines = extracted_text.split('\n')
+                current_result = {}
+
+                for line in lines:
+                    line = line.strip()
+                    if line.startswith('http'):
+                        if current_result:
+                            search_results.append(current_result)
+                        current_result = {'url': line, 'title': '', 'snippet': ''}
+                    elif current_result and not current_result['title']:
+                        current_result['title'] = line
+                    elif current_result:
+                        current_result['snippet'] += line + ' '
+
+                if current_result:
+                    search_results.append(current_result)
+
+        # Fallback: create basic results if parsing failed
+        if not search_results:
+            print("DEBUG: Could not parse agent results, returning empty list")
+
+        return search_results[:10]  # Top 10 results
+
+    def _extract_content_from_result(self, result) -> str:
+        """Extract content from browser-use agent result"""
+        if isinstance(result, dict) and 'history' in result:
+            history = result['history']
+            if history and len(history) > 0:
+                last_item = history[-1]
+                return last_item.get('result', '')
+
+        return str(result) if result else ""
+
+    async def close(self):
+        """Close browser-use session"""
+        if self.browser_session:
+            await self.browser_session.close()
+            self.browser_session = None
+
+
+# ============================================================================
+# Browser-Based Search Tools
+# ============================================================================
+
+class BraveSearchTool:
+    """Web search using Brave Search with LLM-guided navigation (with optional vision)"""
+
+    def __init__(self, browser_manager: ChromiumBrowserManager, navigator, use_vision: bool = False):
+        self.browser_manager = browser_manager
+        self.navigator = navigator
+        self.use_vision = use_vision
+        self.name = "BraveSearch"
+
+    def execute(self, query: str, count: int = 10, prefer_academic: bool = True) -> Dict:
+        """Search using Brave and extract content"""
+        try:
+            # Add academic qualifiers if preferred
+            if prefer_academic:
+                academic_terms = ["research", "study", "paper", "journal", "academic"]
+                if not any(term in query.lower() for term in academic_terms):
+                    query = f"{query} research academic"
+
+            # Run async search
+            return asyncio.run(self._async_execute(query, count))
+
+        except Exception as e:
+            print(f"ERROR: Brave search failed: {e}")
+            return {
+                "success": False,
+                "query": query,
+                "error": str(e),
+                "results": []
+            }
+
+    async def _async_execute(self, query: str, count: int) -> Dict:
+        """Async execution of search"""
+        try:
+            # Use vision-based navigation if available
+            if self.use_vision and isinstance(self.navigator, VisionBrowserNavigator):
+                print("DEBUG: Using computer vision for Brave search")
+                # Vision navigator handles everything
+                result = await self.navigator.navigate_and_search_with_vision(
+                    Config.BRAVE_SEARCH_URL,
+                    query,
+                    "Brave"
+                )
+
+                if not result['success']:
+                    return result
+
+                # Scrape content from results with vision
+                enriched_results = []
+                for search_result in result['results'][:count]:
+                    try:
+                        scrape_result = await self.navigator.scrape_url_with_vision(search_result['url'])
+
+                        if scrape_result['success']:
+                            quality_score = self._assess_quality(
+                                search_result['url'].lower(),
+                                scrape_result['text']
+                            )
+
+                            enriched_results.append({
+                                "title": search_result['title'],
+                                "url": search_result['url'],
+                                "description": search_result['snippet'],
+                                "markdown": scrape_result['text'],
+                                "quality_score": quality_score,
+                                "content_length": len(scrape_result['text'])
+                            })
+
+                        await asyncio.sleep(2)  # Rate limiting for vision
+
+                    except Exception as e:
+                        print(f"DEBUG: Vision scraping failed for {search_result['url']}: {e}")
+                        continue
+
+                enriched_results.sort(key=lambda x: x['quality_score'], reverse=True)
+                print(f"DEBUG: Vision-based Brave search found {len(enriched_results)} results")
+
+                return {
+                    "success": True,
+                    "query": query,
+                    "results": enriched_results,
+                    "count": len(enriched_results)
+                }
+
+            # Fallback to pattern-based navigation
+            await self.browser_manager.initialize()
+            page = await self.browser_manager.new_page()
+
+            # Navigate and search
+            result = await self.navigator.navigate_and_search(
+                page,
+                Config.BRAVE_SEARCH_URL,
+                query,
+                "Brave"
+            )
+
+            if not result['success']:
+                await page.close()
+                return result
+
+            # Scrape content from top results
+            enriched_results = []
+            for search_result in result['results'][:count]:
+                try:
+                    # Create new page for scraping to avoid conflicts
+                    scrape_page = await self.browser_manager.new_page()
+                    scrape_result = await self.navigator.scrape_url(scrape_page, search_result['url'])
+                    await scrape_page.close()
+
+                    if scrape_result['success']:
+                        # Assess quality
+                        quality_score = self._assess_quality(
+                            search_result['url'].lower(),
+                            scrape_result['text']
+                        )
+
+                        enriched_results.append({
+                            "title": search_result['title'],
+                            "url": search_result['url'],
+                            "description": search_result['snippet'],
+                            "markdown": scrape_result['text'],
+                            "quality_score": quality_score,
+                            "content_length": len(scrape_result['text'])
+                        })
+
+                    await asyncio.sleep(1)  # Rate limiting
+
+                except Exception as e:
+                    print(f"DEBUG: Failed to scrape {search_result['url']}: {e}")
+                    continue
+
+            await page.close()
+            await self.browser_manager.save_session()
+
+            # Sort by quality score
+            enriched_results.sort(key=lambda x: x['quality_score'], reverse=True)
+
+            print(f"DEBUG: Brave found {len(enriched_results)} results with content")
+
+            return {
+                "success": True,
+                "query": query,
+                "results": enriched_results,
+                "count": len(enriched_results)
+            }
+
+        except Exception as e:
+            print(f"ERROR: Async search failed: {e}")
+            return {
+                "success": False,
+                "query": query,
+                "error": str(e),
+                "results": []
+            }
+
+    def _assess_quality(self, url: str, content: str) -> float:
+        """Assess source quality based on URL and content (0.0-1.0)"""
+        score = 0.5  # Base score
+
+        # Academic domains get high scores
+        academic_indicators = [
+            '.edu', '.gov', 'arxiv', 'scholar', 'pubmed',
+            'ieee', 'acm', 'springer', 'nature', 'science',
+            'journal', 'research', 'academic', 'pmc.ncbi'
+        ]
+
+        for indicator in academic_indicators:
+            if indicator in url:
+                score += 0.05
+
+        # Content quality indicators
+        if len(content) > 5000:
+            score += 0.1
+        if len(content) > 10000:
+            score += 0.1
+
+        # Research terms
+        research_terms = ['study', 'research', 'analysis', 'evidence', 'findings',
+                         'methodology', 'hypothesis', 'conclusion']
+        content_lower = content.lower()
+        term_count = sum(1 for term in research_terms if term in content_lower)
+        score += min(term_count * 0.02, 0.15)
+
+        return min(score, 1.0)
+
+
+class DuckDuckGoSearchTool:
+    """Web search using DuckDuckGo with LLM-guided navigation (with optional vision)"""
+
+    def __init__(self, browser_manager: ChromiumBrowserManager, navigator, use_vision: bool = False):
+        self.browser_manager = browser_manager
+        self.navigator = navigator
+        self.use_vision = use_vision
+        self.name = "DuckDuckGoSearch"
+
+    def execute(self, query: str, count: int = 10, prefer_academic: bool = True) -> Dict:
+        """Search using DuckDuckGo and extract content"""
+        try:
+            # Add academic qualifiers if preferred
+            if prefer_academic:
+                academic_terms = ["research", "study", "paper", "journal", "academic"]
+                if not any(term in query.lower() for term in academic_terms):
+                    query = f"{query} research academic"
+
+            # Run async search
+            return asyncio.run(self._async_execute(query, count))
+
+        except Exception as e:
+            print(f"ERROR: DuckDuckGo search failed: {e}")
+            return {
+                "success": False,
+                "query": query,
+                "error": str(e),
+                "results": []
+            }
+
+    async def _async_execute(self, query: str, count: int) -> Dict:
+        """Async execution of search"""
+        try:
+            # Use vision-based navigation if available
+            if self.use_vision and isinstance(self.navigator, VisionBrowserNavigator):
+                print("DEBUG: Using computer vision for DuckDuckGo search")
+                result = await self.navigator.navigate_and_search_with_vision(
+                    Config.DUCKDUCKGO_SEARCH_URL,
+                    query,
+                    "DuckDuckGo"
+                )
+
+                if not result['success']:
+                    return result
+
+                # Scrape content from results with vision
+                enriched_results = []
+                for search_result in result['results'][:count]:
+                    try:
+                        scrape_result = await self.navigator.scrape_url_with_vision(search_result['url'])
+
+                        if scrape_result['success']:
+                            quality_score = self._assess_quality(
+                                search_result['url'].lower(),
+                                scrape_result['text']
+                            )
+
+                            enriched_results.append({
+                                "title": search_result['title'],
+                                "url": search_result['url'],
+                                "description": search_result['snippet'],
+                                "markdown": scrape_result['text'],
+                                "quality_score": quality_score,
+                                "content_length": len(scrape_result['text'])
+                            })
+
+                        await asyncio.sleep(2)  # Rate limiting for vision
+
+                    except Exception as e:
+                        print(f"DEBUG: Vision scraping failed for {search_result['url']}: {e}")
+                        continue
+
+                enriched_results.sort(key=lambda x: x['quality_score'], reverse=True)
+                print(f"DEBUG: Vision-based DuckDuckGo search found {len(enriched_results)} results")
+
+                return {
+                    "success": True,
+                    "query": query,
+                    "results": enriched_results,
+                    "count": len(enriched_results)
+                }
+
+            # Fallback to pattern-based navigation
+            await self.browser_manager.initialize()
+            page = await self.browser_manager.new_page()
+
+            # Navigate and search
+            result = await self.navigator.navigate_and_search(
+                page,
+                Config.DUCKDUCKGO_SEARCH_URL,
+                query,
+                "DuckDuckGo"
+            )
+
+            if not result['success']:
+                await page.close()
+                return result
+
+            # Scrape content from top results
+            enriched_results = []
+            for search_result in result['results'][:count]:
+                try:
+                    # Create new page for scraping
+                    scrape_page = await self.browser_manager.new_page()
+                    scrape_result = await self.navigator.scrape_url(scrape_page, search_result['url'])
+                    await scrape_page.close()
+
+                    if scrape_result['success']:
+                        # Assess quality
+                        quality_score = self._assess_quality(
+                            search_result['url'].lower(),
+                            scrape_result['text']
+                        )
+
+                        enriched_results.append({
+                            "title": search_result['title'],
+                            "url": search_result['url'],
+                            "description": search_result['snippet'],
+                            "markdown": scrape_result['text'],
+                            "quality_score": quality_score,
+                            "content_length": len(scrape_result['text'])
+                        })
+
+                    await asyncio.sleep(1)  # Rate limiting
+
+                except Exception as e:
+                    print(f"DEBUG: Failed to scrape {search_result['url']}: {e}")
+                    continue
+
+            await page.close()
+            await self.browser_manager.save_session()
+
+            # Sort by quality score
+            enriched_results.sort(key=lambda x: x['quality_score'], reverse=True)
+
+            print(f"DEBUG: DuckDuckGo found {len(enriched_results)} results with content")
+
+            return {
+                "success": True,
+                "query": query,
+                "results": enriched_results,
+                "count": len(enriched_results)
+            }
+
+        except Exception as e:
+            print(f"ERROR: Async search failed: {e}")
+            return {
+                "success": False,
+                "query": query,
+                "error": str(e),
+                "results": []
+            }
+
+    def _assess_quality(self, url: str, content: str) -> float:
+        """Assess source quality (same as Brave)"""
+        score = 0.5
+
+        academic_indicators = [
+            '.edu', '.gov', 'arxiv', 'scholar', 'pubmed',
+            'ieee', 'acm', 'springer', 'nature', 'science',
+            'journal', 'research', 'academic', 'pmc.ncbi'
+        ]
+
+        for indicator in academic_indicators:
+            if indicator in url:
+                score += 0.05
+
+        if len(content) > 5000:
+            score += 0.1
+        if len(content) > 10000:
+            score += 0.1
+
+        research_terms = ['study', 'research', 'analysis', 'evidence', 'findings',
+                         'methodology', 'hypothesis', 'conclusion']
+        content_lower = content.lower()
+        term_count = sum(1 for term in research_terms if term in content_lower)
+        score += min(term_count * 0.02, 0.15)
+
+        return min(score, 1.0)
+
+
+class BrowserScraperTool:
+    """Scrape individual URLs using browser (with optional vision)"""
+
+    def __init__(self, browser_manager: ChromiumBrowserManager, navigator, use_vision: bool = False):
+        self.browser_manager = browser_manager
+        self.navigator = navigator
+        self.use_vision = use_vision
+        self.name = "BrowserScraper"
+
+    def execute(self, url: str) -> Dict:
+        """Scrape a single URL"""
+        try:
+            return asyncio.run(self._async_execute(url))
+        except Exception as e:
+            return {
+                "success": False,
+                "url": url,
+                "error": str(e)
+            }
+
+    async def _async_execute(self, url: str) -> Dict:
+        """Async execution of scraping"""
+        try:
+            # Use vision-based scraping if available
+            if self.use_vision and isinstance(self.navigator, VisionBrowserNavigator):
+                print(f"DEBUG: Using computer vision to scrape {url}")
+                result = await self.navigator.scrape_url_with_vision(url)
+                return result
+
+            # Fallback to pattern-based scraping
+            await self.browser_manager.initialize()
+            page = await self.browser_manager.new_page()
+
+            result = await self.navigator.scrape_url(page, url)
+
+            await page.close()
+            await self.browser_manager.save_session()
+
+            return result
+
+        except Exception as e:
+            return {
+                "success": False,
+                "url": url,
+                "error": str(e)
+            }
+
+
+# ============================================================================
+# Legacy Firecrawl Tools (Kept as Fallback)
 # ============================================================================
 
 class FirecrawlSearchTool:
@@ -426,19 +1410,52 @@ class WebScraperTool:
 
 class ToolRegistry:
     """Manage research tools"""
-    
-    def __init__(self):
+
+    def __init__(self, reasoning_engine):
         self.tools = {}
         self.usage_stats = {}
+        self.reasoning = reasoning_engine
+        self.browser_manager = None
+        self.vision_navigator = None
         self.load_foundation_tools()
-        
+
     def load_foundation_tools(self):
-        """Load core research tools"""
-        firecrawl = FirecrawlSearchTool(Config.FIRECRAWL_API_KEY)
-        scraper = FirecrawlScraperTool(Config.FIRECRAWL_API_KEY)
-        
-        self.register_tool(firecrawl.name, firecrawl)
-        self.register_tool(scraper.name, scraper)
+        """Load core research tools - using browser-based search with optional vision"""
+        # Initialize browser infrastructure
+        self.browser_manager = ChromiumBrowserManager(
+            Config.BROWSER_DATA_PATH,
+            headless=Config.BROWSER_HEADLESS
+        )
+
+        # Choose navigator based on vision configuration
+        if Config.USE_VISION and BROWSER_USE_AVAILABLE:
+            print("INFO: Using VisionBrowserNavigator (Agent0-style computer vision)")
+            self.vision_navigator = VisionBrowserNavigator(self.reasoning)
+            navigator = self.vision_navigator
+        else:
+            if Config.USE_VISION and not BROWSER_USE_AVAILABLE:
+                print("WARNING: Vision requested but browser-use not available. Falling back to pattern-based navigation.")
+            navigator = LLMBrowserNavigator(self.reasoning)
+
+        # Register browser-based search tools
+        brave_search = BraveSearchTool(self.browser_manager, navigator, use_vision=Config.USE_VISION)
+        duckduckgo_search = DuckDuckGoSearchTool(self.browser_manager, navigator, use_vision=Config.USE_VISION)
+        browser_scraper = BrowserScraperTool(self.browser_manager, navigator, use_vision=Config.USE_VISION)
+
+        # Use Brave as the primary search tool
+        self.register_tool("FirecrawlSearch", brave_search)  # Keep same name for compatibility
+        self.register_tool("BraveSearch", brave_search)
+        self.register_tool("DuckDuckGoSearch", duckduckgo_search)
+        self.register_tool("BrowserScraper", browser_scraper)
+        self.register_tool("FirecrawlScraper", browser_scraper)  # Keep same name for compatibility
+
+    def cleanup(self):
+        """Cleanup browser resources"""
+        if self.browser_manager:
+            asyncio.run(self.browser_manager.close())
+
+        if self.vision_navigator:
+            asyncio.run(self.vision_navigator.close())
         
     def register_tool(self, name: str, tool: Any):
         """Register a tool"""
@@ -469,13 +1486,15 @@ class ToolRegistry:
 
 class ReasoningEngine:
     """LLM-powered reasoning for research"""
-    
-    def __init__(self, api_key: str, model: str):
+
+    def __init__(self, api_key: str, model: str, vision_model: str = None, vision_api_key: str = None):
         self.api_key = api_key
         self.model = model
+        self.vision_model = vision_model or model
+        self.vision_api_key = vision_api_key or api_key
         self.base_url = "https://openrouter.ai/api/v1/chat/completions"
-        
-    def reason(self, prompt: str, system_prompt: str = None, 
+
+    def reason(self, prompt: str, system_prompt: str = None,
                max_tokens: int = 6000) -> str:
         """Send reasoning request"""
         try:
@@ -483,23 +1502,65 @@ class ReasoningEngine:
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json"
             }
-            
+
             messages = []
             if system_prompt:
                 messages.append({"role": "system", "content": system_prompt})
             messages.append({"role": "user", "content": prompt})
-            
+
             data = {
                 "model": self.model,
                 "messages": messages,
                 "max_tokens": max_tokens
             }
-            
+
             response = requests.post(self.base_url, headers=headers, json=data)
             response.raise_for_status()
-            
+
             return response.json()["choices"][0]["message"]["content"]
-            
+
+        except Exception as e:
+            return f"ERROR: {str(e)}"
+
+    def reason_with_vision(self, prompt: str, image_base64: str,
+                          system_prompt: str = None, max_tokens: int = 6000) -> str:
+        """Send reasoning request with vision (screenshot analysis)"""
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.vision_api_key}",
+                "Content-Type": "application/json"
+            }
+
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+
+            # Build message with image
+            user_message = {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{image_base64}"
+                        }
+                    }
+                ]
+            }
+            messages.append(user_message)
+
+            data = {
+                "model": self.vision_model,
+                "messages": messages,
+                "max_tokens": max_tokens
+            }
+
+            response = requests.post(self.base_url, headers=headers, json=data)
+            response.raise_for_status()
+
+            return response.json()["choices"][0]["message"]["content"]
+
         except Exception as e:
             return f"ERROR: {str(e)}"
 
@@ -1131,25 +2192,40 @@ Return ONLY valid JSON (no markdown):
 
 class AcademicDiscoveryAgent:
     """Rigorous research agent focused on validated discovery"""
-    
+
     def __init__(self):
         self.knowledge = AcademicKnowledgeBase(Config.KNOWLEDGE_PATH)
-        self.tools = ToolRegistry()
         self.cycle_count = 0
         self.running = False
+
+        # Initialize reasoning engine with vision support
         self.reasoning = ReasoningEngine(
             Config.OPENROUTER_API_KEY,
-            Config.OPENROUTER_MODEL
+            Config.OPENROUTER_MODEL,
+            vision_model=Config.VISION_MODEL,
+            vision_api_key=Config.VISION_MODEL_API_KEY
         )
+
+        # Pass reasoning engine to ToolRegistry for LLM-guided navigation
+        self.tools = ToolRegistry(self.reasoning)
+
         self.research = ResearchCycle(
             self.knowledge,
             self.tools,
             self.reasoning
         )
-        
+
         self.setup_logging()
         self.log_inspector = LogInspector(self.reasoning, Config.LOGS_PATH, self.logger)
-        self.logger.info("Academic Discovery Agent initialized")
+        self.logger.info("Academic Discovery Agent initialized with browser-based search")
+
+        if Config.USE_VISION and BROWSER_USE_AVAILABLE:
+            self.logger.info("Using: Agent0-style Computer Vision Navigation (browser-use)")
+            self.logger.info(f"Vision Model: {Config.VISION_MODEL}")
+        else:
+            self.logger.info("Using: Pattern-based LLM navigation")
+
+        self.logger.info("Search Engines: Brave Search and DuckDuckGo")
         self.logger.info("Vision: When it knows everything, it will know more using that knowledge")
     
     def setup_logging(self):
@@ -1230,6 +2306,8 @@ class AcademicDiscoveryAgent:
             self.logger.info("\n\nResearch interrupted by user")
         finally:
             self.running = False
+            self.logger.info("Cleaning up browser resources...")
+            self.tools.cleanup()
             self._generate_final_report()
     
     def _generate_final_report(self):
