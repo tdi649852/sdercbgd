@@ -1,0 +1,19 @@
+# Academic Discovery Agent - Dependencies
+# Browser automation with LLM-guided navigation
+
+# Core dependencies
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+
+# Browser automation
+playwright>=1.40.0
+
+# Async support (included in Python 3.7+, but listed for clarity)
+# asyncio is built-in
+
+# Optional: For enhanced HTML parsing
+lxml>=4.9.0
+
+# Note: After installing, run:
+# playwright install chromium
+# This downloads the Chromium browser binary for Playwright
