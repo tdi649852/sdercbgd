@@ -436,9 +436,23 @@ class ToolRegistry:
         """Load core research tools"""
         firecrawl = FirecrawlSearchTool(Config.FIRECRAWL_API_KEY)
         scraper = FirecrawlScraperTool(Config.FIRECRAWL_API_KEY)
-        
+
         self.register_tool(firecrawl.name, firecrawl)
         self.register_tool(scraper.name, scraper)
+
+        # Load browser vision tool for visual web scraping
+        try:
+            from browser_vision_agent import BrowserVisionTool
+            browser_vision = BrowserVisionTool(
+                Config.OPENROUTER_API_KEY,
+                vision_model="anthropic/claude-3.5-sonnet"
+            )
+            self.register_tool(browser_vision.name, browser_vision)
+            print("✓ Browser Vision tool loaded successfully")
+        except ImportError as e:
+            print(f"WARNING: Browser Vision tool not available: {e}")
+        except Exception as e:
+            print(f"WARNING: Failed to load Browser Vision tool: {e}")
         
     def register_tool(self, name: str, tool: Any):
         """Register a tool"""
