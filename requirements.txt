@@ -1,5 +1,5 @@
 # Academic Discovery Agent - Dependencies
-# Browser automation with LLM-guided navigation
+# Browser automation with LLM-guided navigation and computer vision
 
 # Core dependencies
 requests>=2.31.0
@@ -7,6 +7,10 @@ beautifulsoup4>=4.12.0
 
 # Browser automation
 playwright>=1.40.0
+browser-use>=0.1.0
+
+# Vision capabilities
+pillow>=10.0.0
 
 # Async support (included in Python 3.7+, but listed for clarity)
 # asyncio is built-in
